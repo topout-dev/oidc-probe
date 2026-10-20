@@ -1,0 +1,5 @@
+{
+  "name": "oidc-probe",
+  "private": true,
+  "packageManager": "pnpm@11.28.2"
+}

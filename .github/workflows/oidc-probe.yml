@@ -1,0 +1,374 @@
+# A throwaway probe of GitHub Actions behaviour, called from other repos by tag or by SHA.
+# It records claim names and non-secret values (IDs, refs, SHAs, times) in the run summary and the
+# job log. It never prints, stores or uploads an OIDC token, a signature or a request token.
+name: OIDC probe
+
+on:
+  workflow_call:
+    inputs:
+      variant:
+        description: "The caller's label, recorded with every value"
+        type: string
+        required: true
+      api-url:
+        description: "The caller's vars.TOPOUT_API_URL (may be empty); used only as a token audience"
+        type: string
+        required: false
+      toolchain:
+        description: "Run the build job (Node, pnpm, the CLI, an artifact)"
+        type: boolean
+        required: false
+        default: false
+      fail-first-attempt:
+        description: "Fail attempt 1 on purpose, so a re-run has something to re-run"
+        type: boolean
+        required: false
+        default: false
+      hold-seconds:
+        description: "Hold the claims job's concurrency group this long"
+        type: number
+        required: false
+        default: 0
+
+# bash -eo pipefail: a failing command in a pipeline fails its step (a step without a shell gets bash -e).
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Changed when probe-1 is moved, so a re-run shows which file version ran.
+  PROBE_REVISION: "1"
+  TOPOUT_CLI: "1.0.0-alpha.4"
+
+jobs:
+  # Shaped like the build job of the real workflow: no id-token, the caller's code checked out.
+  build:
+    if: ${{ inputs.toolchain }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the caller's repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Record the build job's toolchain
+        run: |
+          set -u
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then id_token=yes; else id_token=no; fi
+          node_v=$(node --version)
+          npm_v=$(npm --version)
+          {
+            echo "### build job"
+            echo ""
+            echo "| what | value |"
+            echo "|---|---|"
+            echo "| OIDC request variables present | ${id_token} |"
+            echo "| node --version | ${node_v} |"
+            echo "| npm --version | ${npm_v} |"
+            echo "| runner image | ${ImageOS:-unknown} ${ImageVersion:-unknown} |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "PROBE-RECORD {\"job\":\"build\",\"oidcRequestVariables\":\"${id_token}\",\"node\":\"${node_v}\"}"
+
+      - name: Install the CLI into RUNNER_TEMP
+        id: cli
+        continue-on-error: true
+        run: |
+          npm install --prefix "$RUNNER_TEMP/topout" --no-save --ignore-scripts --no-audit --no-fund "topout@$TOPOUT_CLI"
+          cli_v=$("$RUNNER_TEMP/topout/node_modules/.bin/topout" --version)
+          echo "topout --version: ${cli_v}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Load esbuild and the native keyring from the install
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/topout
+        run: |
+          node -e 'const e = require("esbuild"); e.transformSync("let a = 1"); console.log("esbuild " + e.version + " transforms")' | tee -a "$GITHUB_STEP_SUMMARY"
+          node -e 'require("@napi-rs/keyring"); console.log("@napi-rs/keyring loads")' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Enable pnpm through corepack
+        id: pnpm
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          corepack enable
+          pnpm_v=$(pnpm --version)
+          echo "pnpm in the checkout: ${pnpm_v}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Create a sample app with the CLI
+        id: create
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set +e
+          "$RUNNER_TEMP/topout/node_modules/.bin/topout" create app probe-sample --dir apps/probe-sample --no-register --package-manager pnpm > "$RUNNER_TEMP/create.txt" 2>&1
+          code=$?
+          { echo "create app exited ${code}; its last lines:"; echo '```'; tail -n 20 "$RUNNER_TEMP/create.txt"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -eq 0 ]; then
+            app_pnpm_v=$(cd apps/probe-sample && pnpm --version) || app_pnpm_v="pnpm --version failed"
+            echo "pnpm in apps/probe-sample: ${app_pnpm_v}" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$code"
+
+      - name: Build the sample app with the CLI
+        id: topout-build
+        continue-on-error: true
+        timeout-minutes: 10
+        working-directory: apps/probe-sample
+        run: |
+          set +e
+          "$RUNNER_TEMP/topout/node_modules/.bin/topout" build > "$RUNNER_TEMP/build.txt" 2>&1
+          code=$?
+          { echo "topout build exited ${code}; its last lines:"; echo '```'; tail -n 20 "$RUNNER_TEMP/build.txt"; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
+      - name: Assemble the artifact, with hidden files
+        env:
+          SHA: ${{ github.sha }}
+          CLI_OUTCOME: ${{ steps.cli.outcome }}
+          PNPM_OUTCOME: ${{ steps.pnpm.outcome }}
+          CREATE_OUTCOME: ${{ steps.create.outcome }}
+          BUILD_OUTCOME: ${{ steps.topout-build.outcome }}
+        run: |
+          out="$RUNNER_TEMP/probe-ci"
+          mkdir -p "$out/apps/probe-sample" "$out/.probe-hidden-dir"
+          if [ -d apps/probe-sample/.topout/output ]; then cp -R apps/probe-sample/.topout/output/. "$out/apps/probe-sample/"; fi
+          echo "hidden" > "$out/.probe-hidden"
+          echo "hidden" > "$out/.probe-hidden-dir/file"
+          file_count=$(find "$out" -type f | wc -l)
+          printf '{"version":1,"sha":"%s","apps":[{"path":"apps/probe-sample","name":"probe-sample","status":"%s"}]}\n' "$SHA" "$BUILD_OUTCOME" > "$out/plan.json"
+          {
+            echo ""
+            echo "| step | outcome |"
+            echo "|---|---|"
+            echo "| CLI install | ${CLI_OUTCOME} |"
+            echo "| corepack pnpm | ${PNPM_OUTCOME} |"
+            echo "| create app | ${CREATE_OUTCOME} |"
+            echo "| topout build | ${BUILD_OUTCOME} |"
+            echo "| files in the artifact | ${file_count} |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "PROBE-RECORD {\"job\":\"build\",\"cli\":\"${CLI_OUTCOME}\",\"pnpm\":\"${PNPM_OUTCOME}\",\"create\":\"${CREATE_OUTCOME}\",\"build\":\"${BUILD_OUTCOME}\"}"
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: probe-ci
+          path: ${{ runner.temp }}/probe-ci/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+  # Shaped like the deploy job of the real workflow: id-token only, no checkout, a concurrency group.
+  claims:
+    needs: build
+    if: ${{ !cancelled() }}
+    permissions:
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: probe-claims-${{ github.repository_id }}-${{ inputs.variant }}
+      cancel-in-progress: false
+    env:
+      API_URL: ${{ inputs.api-url || 'https://api.topout.ai' }}
+    steps:
+      - name: Download the build job's artifact
+        id: download
+        if: ${{ inputs.toolchain }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: probe-ci
+          path: ${{ runner.temp }}/probe-artifact
+
+      - name: Record the downloaded files
+        if: ${{ inputs.toolchain }}
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        run: |
+          dir="$RUNNER_TEMP/probe-artifact"
+          {
+            echo "### claims job: the artifact"
+            echo ""
+            echo "download: ${DOWNLOAD_OUTCOME}"
+            echo ""
+            echo '```'
+            if [ -d "$dir" ]; then (cd "$dir" && find . -type f | sort); else echo "(no directory)"; fi
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -f "$dir/.probe-hidden" ]; then hidden=yes; else hidden=no; fi
+          echo "PROBE-RECORD {\"job\":\"claims\",\"download\":\"${DOWNLOAD_OUTCOME}\",\"hiddenFileKept\":\"${hidden}\"}"
+
+      - name: Record the context
+        env:
+          VARIANT: ${{ inputs.variant }}
+          PROBE_REVISION: ${{ env.PROBE_REVISION }}
+          INPUT_API_URL: ${{ toJSON(inputs.api-url) }}
+          AUDIENCE: ${{ env.API_URL }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ON_DEFAULT_BRANCH: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+          CONCURRENCY_GROUP: ${{ format('probe-claims-{0}-{1}', github.repository_id, inputs.variant) }}
+          RUNNER_ENV: ${{ runner.environment }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from "node:fs";
+          const names = [
+            "VARIANT", "PROBE_REVISION", "INPUT_API_URL", "AUDIENCE", "EVENT_NAME", "REF", "REF_TYPE",
+            "DEFAULT_BRANCH", "ON_DEFAULT_BRANCH", "SHA", "REPOSITORY", "REPOSITORY_ID", "REPOSITORY_OWNER_ID",
+            "WORKFLOW_REF", "WORKFLOW_SHA", "RUN_ID", "RUN_NUMBER", "RUN_ATTEMPT", "RUN_URL",
+            "CONCURRENCY_GROUP", "RUNNER_ENV", "BUILD_RESULT",
+          ];
+          const record = {};
+          for (const name of names) record[name] = process.env[name] ?? null;
+          record.NODE = process.version;
+          const cell = (v) => String(v).replaceAll("|", "\\|");
+          const lines = ["### claims job: the context", "", "| name | value |", "|---|---|"];
+          for (const [k, v] of Object.entries(record)) lines.push(`| ${k} | ${cell(v)} |`);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n\n");
+          console.log("PROBE-RECORD " + JSON.stringify({ job: "claims", context: record }));
+          JS
+
+      - name: Request and decode the OIDC tokens (never printed)
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync } from "node:fs";
+          // Only these values are ever written: claim names, JSON types and non-secret values, never a
+          // token, a token segment, a signature or the request token. Errors are fixed messages.
+          const summary = (s) => appendFileSync(process.env.GITHUB_STEP_SUMMARY, s + "\n");
+          const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+          const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+          const audience = process.env.API_URL;
+          const SHAPE_ONLY = new Set(["jti"]);
+          const EXPECTED = [
+            "actor", "actor_id", "aud", "base_ref", "event_name", "exp", "head_ref", "iat", "iss",
+            "job_workflow_ref", "job_workflow_sha", "jti", "nbf", "ref", "ref_protected", "ref_type",
+            "repository", "repository_id", "repository_owner", "repository_owner_id", "repository_visibility",
+            "run_attempt", "run_id", "run_number", "runner_environment", "sha", "sub", "workflow",
+            "workflow_ref", "workflow_sha",
+          ];
+          const record = { job: "claims", oidcRequestVariables: Boolean(requestUrl && requestToken) };
+          function shape(v) {
+            const s = String(v);
+            const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+            return `${typeof v}, ${s.length} chars${uuid ? ", UUID form" : ""}`;
+          }
+          async function request(aud) {
+            const url = new URL(requestUrl);
+            if (aud !== undefined) url.searchParams.set("audience", aud);
+            let res;
+            try {
+              res = await fetch(url, { headers: { authorization: `bearer ${requestToken}`, accept: "application/json" } });
+            } catch {
+              return { status: "network error" };
+            }
+            if (!res.ok) return { status: res.status };
+            let jwt;
+            try {
+              const body = await res.json();
+              jwt = typeof body?.value === "string" ? body.value : undefined;
+            } catch {
+              return { status: res.status, problem: "body is not JSON" };
+            }
+            if (jwt === undefined) return { status: res.status, problem: "no value in the body" };
+            const parts = jwt.split(".");
+            if (parts.length !== 3) return { status: res.status, problem: `${parts.length} segments, not 3` };
+            try {
+              const header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+              const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+              const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+              if (!isObject(header) || !isObject(payload))
+                return { status: res.status, problem: "header or payload is not a JSON object" };
+              return { status: res.status, header, payload };
+            } catch {
+              return { status: res.status, problem: "header or payload is not base64url JSON" };
+            }
+          }
+          if (!record.oidcRequestVariables) {
+            summary("### claims job: OIDC\n\nThe OIDC request variables are absent (no id-token: write).\n");
+            console.log("PROBE-RECORD " + JSON.stringify(record));
+            process.exit(1);
+          }
+          const withAud = await request(audience);
+          const defaultAud = await request(undefined);
+          record.requestStatus = withAud.status;
+          record.defaultAudienceRequestStatus = defaultAud.status;
+          if (withAud.problem) record.problem = withAud.problem;
+          if (defaultAud.problem) record.defaultAudienceProblem = defaultAud.problem;
+          const lines = ["### claims job: OIDC", ""];
+          if (withAud.payload) {
+            const p = withAud.payload;
+            const claims = {};
+            for (const name of Object.keys(p).sort()) {
+              claims[name] = SHAPE_ONLY.has(name)
+                ? { type: typeof p[name], shape: shape(p[name]) }
+                : { type: typeof p[name], value: p[name] };
+            }
+            record.header = {
+              names: Object.keys(withAud.header).sort(),
+              alg: withAud.header.alg ?? null,
+              typ: withAud.header.typ ?? null,
+            };
+            record.claims = claims;
+            record.missing = EXPECTED.filter((n) => !(n in p));
+            record.extra = Object.keys(p).filter((n) => !EXPECTED.includes(n)).sort();
+            const num = (n) => (typeof p[n] === "number" ? p[n] : null);
+            record.expMinusIat = num("exp") !== null && num("iat") !== null ? p.exp - p.iat : null;
+            record.iatMinusNbf = num("iat") !== null && num("nbf") !== null ? p.iat - p.nbf : null;
+            record.receivedMinusIat = num("iat") !== null ? Math.round(Date.now() / 1000) - p.iat : null;
+            const cell = (v) => String(v).replaceAll("|", "\\|");
+            lines.push(`requested audience: ${cell(audience)}`, "");
+            lines.push(`header: ${record.header.names.join(", ")} (alg ${record.header.alg}, typ ${record.header.typ})`, "");
+            lines.push("| claim | type | value |", "|---|---|---|");
+            for (const [name, c] of Object.entries(claims)) {
+              lines.push(`| ${name} | ${c.type} | ${cell("shape" in c ? c.shape : JSON.stringify(c.value))} |`);
+            }
+            lines.push("");
+            lines.push(`exp - iat: ${record.expMinusIat} s; iat - nbf: ${record.iatMinusNbf} s; received - iat: ${record.receivedMinusIat} s`);
+            lines.push(`missing from the expected list: ${record.missing.join(", ") || "none"}`);
+            lines.push(`not in the expected list: ${record.extra.join(", ") || "none"}`);
+          } else {
+            lines.push(`token request with audience: status ${withAud.status}${withAud.problem ? `, ${withAud.problem}` : ""}`);
+          }
+          if (defaultAud.payload) {
+            record.defaultAudience = defaultAud.payload.aud ?? null;
+            lines.push("", `default audience (no audience parameter): ${JSON.stringify(record.defaultAudience)}`);
+          } else {
+            lines.push("", `token request without audience: status ${defaultAud.status}${defaultAud.problem ? `, ${defaultAud.problem}` : ""}`);
+          }
+          summary(lines.join("\n") + "\n");
+          console.log("PROBE-RECORD " + JSON.stringify(record));
+          if (!withAud.payload) process.exit(1);
+          JS
+
+      - name: Hold the concurrency group
+        if: ${{ inputs.hold-seconds > 0 }}
+        env:
+          HOLD_SECONDS: ${{ inputs.hold-seconds }}
+        run: sleep "$HOLD_SECONDS"
+
+      - name: Fail the first attempt on purpose
+        if: ${{ inputs.fail-first-attempt && github.run_attempt == '1' }}
+        run: |
+          echo "Attempt 1 fails on purpose, so that Re-run failed jobs has a failed job to re-run." | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 1
