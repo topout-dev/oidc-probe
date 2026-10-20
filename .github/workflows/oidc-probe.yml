@@ -37,7 +37,7 @@ defaults:
 
 env:
   # Changed when probe-1 is moved, so a re-run shows which file version ran.
-  PROBE_REVISION: "1"
+  PROBE_REVISION: "2"
   TOPOUT_CLI: "1.0.0-alpha.4"
 
 jobs:
