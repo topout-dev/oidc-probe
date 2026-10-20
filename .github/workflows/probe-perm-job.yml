@@ -1,0 +1,16 @@
+# Probe caller: called by tag, permissions at job level only; the calling job also sets concurrency.
+name: Probe (tag, job-level permissions only)
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  probe:
+    if: github.repository_owner != 'topout-dev'
+    permissions: { id-token: write, contents: read }
+    concurrency:
+      group: probe-caller-${{ github.repository_id }}-job-level
+      cancel-in-progress: false
+    uses: topout-dev/oidc-probe/.github/workflows/oidc-probe.yml@probe-1
+    with:
+      variant: tag-job-level
+      api-url: ${{ vars.TOPOUT_API_URL }}

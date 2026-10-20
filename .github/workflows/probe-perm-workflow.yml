@@ -1,0 +1,13 @@
+# Probe caller: called by tag, permissions at workflow level only.
+name: Probe (tag, workflow-level permissions only)
+on:
+  push:
+  workflow_dispatch:
+permissions: { id-token: write, contents: read }
+jobs:
+  probe:
+    if: github.repository_owner != 'topout-dev'
+    uses: topout-dev/oidc-probe/.github/workflows/oidc-probe.yml@probe-1
+    with:
+      variant: tag-workflow-level
+      api-url: ${{ vars.TOPOUT_API_URL }}

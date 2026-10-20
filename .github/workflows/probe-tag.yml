@@ -1,0 +1,19 @@
+# Probe caller, shaped like the real shim: called by tag, permissions at workflow and job level.
+# The job is skipped in topout-dev/oidc-probe itself, so it runs only in repos made from this template.
+name: Probe (tag, both permission levels)
+on:
+  push:
+  workflow_dispatch:
+  pull_request:
+permissions: { id-token: write, contents: read }
+jobs:
+  probe:
+    if: github.repository_owner != 'topout-dev'
+    permissions: { id-token: write, contents: read }
+    uses: topout-dev/oidc-probe/.github/workflows/oidc-probe.yml@probe-1
+    with:
+      variant: tag-both
+      api-url: ${{ vars.TOPOUT_API_URL }}
+      toolchain: true
+      fail-first-attempt: true
+      hold-seconds: 180

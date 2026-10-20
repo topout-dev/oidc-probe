@@ -1,0 +1,15 @@
+# Probe caller: called by the SHA of the commit tagged probe-1, permissions at both levels.
+# The placeholder after @ is replaced with that commit's SHA before this file is committed to oidc-probe.
+name: Probe (SHA, both permission levels)
+on:
+  push:
+  workflow_dispatch:
+permissions: { id-token: write, contents: read }
+jobs:
+  probe:
+    if: github.repository_owner != 'topout-dev'
+    permissions: { id-token: write, contents: read }
+    uses: topout-dev/oidc-probe/.github/workflows/oidc-probe.yml@38bb05c9efbd919afea38b1467dbc6d08089a720
+    with:
+      variant: sha-both
+      api-url: ${{ vars.TOPOUT_API_URL }}
